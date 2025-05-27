@@ -1,21 +1,31 @@
-# -*- coding:UTF-8 -*-
-"""Training script for CLIP-Enhanced BCAN (SCAN)"""
+# train.py
+# -*- coding: utf-8 -*-
 
 import os
 import time
 import shutil
+import sys
 import torch
 import torch.nn as nn
 import numpy as np
 import random
-from torch.optim import Adam
-from torch.nn.utils.clip_grad import clip_grad_norm_
-import logging
 import argparse
+import logging
+
+from torch.optim import Adam
+from torch.nn.utils import clip_grad_norm_
+
 from data import get_loaders
 from vocab import deserialize_vocab
 from model import SCAN, ContrastiveLoss
-from evaluation import AverageMeter, encode_data, LogCollector, i2t, t2i, shard_xattn
+from evaluation1 import (
+    AverageMeter,
+    encode_data,
+    LogCollector,
+    i2t,
+    t2i,
+    shard_xattn
+)
 
 def setup_seed(seed):
     """Ensure reproducibility by setting random seeds."""
@@ -27,115 +37,152 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = True
 
 def logging_func(log_file, message):
-    """Log messages to a file."""
+    """Append a message to a log file."""
     with open(log_file, 'a') as f:
-        f.write(message)
-    f.close()
+        f.write(message + '\n')
 
 def main():
+    # Debug print: confirm script launch and arguments
+    print("[DEBUG] train.py started; sys.argv =", sys.argv)
+
     setup_seed(1024)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[DEBUG] Using device: {device}")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', default='/content/drive/My Drive/BCAN/data/f30k_precomp/',
-                        help='Path to dataset')
-    parser.add_argument('--data_name', default='f30k_precomp',
-                        help='Dataset name (coco_precomp or f30k_precomp)')
-    parser.add_argument('--vocab_path', default='./vocab/',
-                        help='Path to vocabulary json files')
-    parser.add_argument('--margin', default=0.2, type=float,
-                        help='Rank loss margin')
-    parser.add_argument('--grad_clip', default=2.0, type=float,
-                        help='Gradient clipping threshold')
-    parser.add_argument('--num_epochs', default=20, type=int,
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', default=128, type=int,
-                        help='Batch size for training')
-    parser.add_argument('--embed_size', default=512, type=int,
-                        help='Embedding size (should match CLIP)')
-    parser.add_argument('--learning_rate', default=2e-4, type=float,
-                        help='Initial learning rate')
-    parser.add_argument('--workers', default=4, type=int,
-                        help='Number of data loader workers')
-    parser.add_argument('--log_step', default=1, type=int,
-                        help='Log frequency (number of batches)')
-    parser.add_argument('--logger_name', default='./runs/logs',
-                        help='Directory to save Tensorboard logs')
-    parser.add_argument('--model_name', default='./runs/model',
-                        help='Directory to save models')
-    parser.add_argument('--resume', default='',
-                        help='Path to latest checkpoint (optional)')
+    parser.add_argument(
+        '--data_path',
+        default=r"E:\sami_bcan\data",
+        help='Root path to dataset (should contain data_name subfolder)'
+    )
+    parser.add_argument(
+        '--data_name',
+        default='flickr8k_raw',
+        help='Dataset name (e.g., f30k_raw or coco_raw)'
+    )
+    parser.add_argument(
+        '--vocab_path',
+        default=r"C:\Users\CGI\Downloads\BCAN-main\BCAN-main\vocab",
+        help='Path to vocabulary JSON files (optional for CLIP)'
+    )
+    parser.add_argument('--margin', default=0.2, type=float, help='Contrastive loss margin')
+    parser.add_argument('--grad_clip', default=2.0, type=float, help='Gradient clipping threshold')
+    parser.add_argument('--num_epochs', default=20, type=int, help='Number of training epochs')
+    parser.add_argument('--batch_size', default=64, type=int, help='Batch size for training')
+    parser.add_argument('--embed_size', default=512, type=int, help='Embedding size (matches CLIP’s 512)')
+    parser.add_argument('--learning_rate', default=2e-4, type=float, help='Initial learning rate')
+    parser.add_argument('--workers', default=4, type=int, help='Number of data loader workers')
+    parser.add_argument('--log_step', default=100, type=int, help='Log frequency (in batches)')
+    parser.add_argument(
+        '--logger_name',
+        default='./runs/logs',
+        help='Directory to save performance logs'
+    )
+    parser.add_argument(
+        '--model_name',
+        default='./runs/model',
+        help='Directory to save model checkpoints'
+    )
+    parser.add_argument('--resume', default='', help='Path to latest checkpoint (optional)')
 
-    opt = parser.parse_known_args()[0]
+    parser.add_argument('--lambda_softmax', type=float, default=9.0,
+                         help='lambda for softmax normalization in attention')
+
+    opt = parser.parse_args()
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
     logging.info('Starting training...')
 
-    # Load Vocabulary
-    vocab = deserialize_vocab(os.path.join(opt.vocab_path, f'{opt.data_name}_vocab.json'))
-    opt.vocab_size = len(vocab)
+    # Load (or skip) Vocabulary
+    # For the CLIP pipeline on raw images, we don't strictly need a word-index vocab.
+    # But we keep this around for backward compatibility if someone runs f30k_precomp.
+    if opt.data_name.endswith('_precomp'):
+        vocab_file = os.path.join(opt.vocab_path, f'{opt.data_name}_vocab.json')
+        print(f"[DEBUG] Loading vocabulary from {vocab_file}")
+        vocab = deserialize_vocab(vocab_file)
+        opt.vocab_size = len(vocab)
+        print(f"[DEBUG] vocab_size = {opt.vocab_size}")
+    else:
+        vocab = None
+        opt.vocab_size = 0
+        print("[DEBUG] Skipping vocabulary load (using CLIP tokenization)")
 
-    # Load Dataset
+    # Load data: train_loader, val_loader
+    # IMPORTANT: get_loaders needs to correctly handle the number of captions per image
+    # and provide the correct indices.
     train_loader, val_loader = get_loaders(opt.data_name, vocab, opt.batch_size, opt.workers, opt)
+    print(f"[DEBUG] train_loader and val_loader created: train_batches = {len(train_loader)}, val_batches = {len(val_loader)}")
 
-    # Initialize Model
+    # Initialize SCAN model
     model = SCAN(opt)
-    model = model.cuda() if torch.cuda.is_available() else model
-    model = nn.DataParallel(model)
+    print("[DEBUG] SCAN model instantiated")
+    model = model.to(device)
+    model = nn.DataParallel(model)  # wrap for multi-GPU if available
+    print("[DEBUG] Model wrapped with DataParallel")
 
     # Define Loss and Optimizer
     criterion = ContrastiveLoss(margin=opt.margin)
-    optimizer = Adam(model.parameters(), lr=opt.learning_rate)
+    # Adding weight_decay for regularization
+    optimizer = Adam(model.parameters(), lr=opt.learning_rate, weight_decay=1e-4) # Added weight_decay
+    print(f"[DEBUG] Optimizer created with lr = {opt.learning_rate}, weight_decay=1e-4")
 
     best_rsum = 0
     start_epoch = 0
 
-    # Resume Training if Required
+    # Resume from checkpoint if provided
     if opt.resume and os.path.isfile(opt.resume):
         checkpoint = torch.load(opt.resume)
         start_epoch = checkpoint['epoch'] + 1
         best_rsum = checkpoint['best_rsum']
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        print(f"Resumed from checkpoint {opt.resume} (Epoch {start_epoch})")
+        print(f"[DEBUG] Resumed from checkpoint {opt.resume} at epoch {start_epoch}, best_rsum = {best_rsum}")
 
-    # Train Model
+    # Training loop
     for epoch in range(start_epoch, opt.num_epochs):
-        print(f"Epoch {epoch}/{opt.num_epochs}")
+        print(f"[DEBUG] --- Epoch {epoch}/{opt.num_epochs - 1} ---")
         if not os.path.exists(opt.model_name):
             os.makedirs(opt.model_name)
+        if not os.path.exists(opt.logger_name):
+            os.makedirs(opt.logger_name)
 
         log_file = os.path.join(opt.logger_name, "performance.log")
-        logging_func(log_file, f"Epoch {epoch} started.\n")
+        logging_func(log_file, f"Epoch {epoch} started.")
 
         adjust_learning_rate(opt, optimizer, epoch)
 
-        # Train for One Epoch
-        train(opt, train_loader, model, criterion, optimizer, epoch, val_loader)
+        train_one_epoch(opt, train_loader, model, criterion, optimizer, epoch, device)
 
-        # Validate Model
-        rsum = validate(opt, val_loader, model)
+        rsum = validate(opt, val_loader, model, device)
 
-        # Save Best Model
         is_best = rsum > best_rsum
         best_rsum = max(rsum, best_rsum)
-        save_checkpoint({
+        checkpoint = {
             'epoch': epoch,
             'model': model.state_dict(),
             'best_rsum': best_rsum,
             'opt': opt,
-            'optimizer': optimizer.state_dict(),
-        }, is_best, filename=f'checkpoint_{epoch}.pth.tar', prefix=opt.model_name + '/')
+            'optimizer': optimizer.state_dict()
+        }
+        save_checkpoint(
+            checkpoint,
+            is_best,
+            filename=f'checkpoint_{epoch}.pth.tar',
+            prefix=opt.model_name + '/'
+        )
 
-def train(opt, train_loader, model, criterion, optimizer, epoch, val_loader):
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    train_logger = LogCollector()
-
+def train_one_epoch(opt, train_loader, model, criterion, optimizer, epoch, device):
+    """
+    Train the model for one epoch.
+    """
     model.train()
     start_time = time.time()
 
-    for i, (images, captions) in enumerate(train_loader):
-        images, captions = images.cuda(), captions.cuda()
+    for i, (images, captions, indices) in enumerate(train_loader):
+        # images: [B, 3, 224, 224], captions: [B, 77]
+        # print(f"[DEBUG] Batch {i}: images.shape = {images.shape}, captions.shape = {captions.shape}")
+        images = images.to(device, non_blocking=True)
+        captions = captions.to(device, non_blocking=True)
 
         optimizer.zero_grad()
         scores = model(images, captions)
@@ -148,35 +195,84 @@ def train(opt, train_loader, model, criterion, optimizer, epoch, val_loader):
         optimizer.step()
 
         if (i + 1) % opt.log_step == 0:
-            elapsed_time = time.time() - start_time
-            print(f"Epoch [{epoch}], Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}, Time: {elapsed_time:.2f}s")
+            elapsed = time.time() - start_time
+            print(f"Epoch [{epoch}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Time: {elapsed:.2f}s")
             start_time = time.time()
 
-def validate(opt, val_loader, model):
+def validate(opt, val_loader, model, device):
+    """
+    Run validation: encode data and compute retrieval metrics.
+    Returns the sum of recalls (r1+r5+r10 + r1i+r5i+r10i).
+    """
     model.eval()
-    img_embs, img_means, cap_embs, cap_means = encode_data(model, val_loader, opt.log_step, logging.info)
+    with torch.no_grad():
+        print(f"[DEBUG_VAL] Starting encode_data...")
+        img_embs, img_means, cap_embs, cap_means = encode_data(model, val_loader, log_step=opt.log_step)
+        print(f"[DEBUG_VAL] encode_data completed.")
 
     start = time.time()
+    
+    # Calculate similarities
+    print(f"[DEBUG_VAL] Before shard_xattn: img_embs shape: {img_embs.shape}, cap_embs shape: {cap_embs.shape}")
+    
+    # Crucial check: Number of images and captions.
+    # For Flickr8k, val_loader usually has 1000 images, 5000 captions (5 per image).
+    num_val_images = img_embs.shape[0]
+    num_val_captions = cap_embs.shape[0]
+    
+    # This assertion can catch basic mismatches early
+    if opt.data_name == 'flickr8k_raw':
+        # Assuming 5 captions per image for Flickr8k_raw
+        expected_captions = num_val_images * 5
+        if expected_captions != num_val_captions:
+            print(f"[ERROR_VAL] Mismatch in expected image/caption count for Flickr8k_raw!")
+            print(f"[ERROR_VAL] Expected {expected_captions} captions for {num_val_images} images but found {num_val_captions}.")
+            print(f"[ERROR_VAL] This mismatch is a likely cause of 'Index out of bounds'.")
+            print(f"[ERROR_VAL] Please check data loading in data.py and ground truth indexing in evaluation.py.")
+    
+    # It's highly probable the "Index out of bounds" happens within shard_xattn or i2t/t2i
+    # because of incorrect assumptions about the dimensions of img_embs, cap_embs, or the
+    # ground truth mapping.
+
     sims = shard_xattn(model, img_embs, img_means, cap_embs, cap_means, opt, shard_size=128)
+    print(f"[DEBUG_VAL] Similarity matrix shape: {sims.shape}")
+    
     end = time.time()
-    print(f"Validation similarity calculation time: {end - start:.2f}s")
+    print(f"[DEBUG_VAL] Validation similarity calculation time: {end - start:.2f}s")
 
-    r1, r5, r10, medr, meanr = i2t(img_embs, cap_embs, sims)
-    print(f"Image to Text Retrieval: R@1: {r1:.1f}, R@5: {r5:.1f}, R@10: {r10:.1f}")
+    # Evaluate using the updated functions that return (metrics, ranks)
+    # The 'Index out of bounds' error means that the internal indexing within i2t/t2i
+    # is failing, likely when trying to retrieve the ground truth caption/image based on its index.
+    # Ensure the 'caps_per_image' or similar parameter is correctly handled in i2t/t2i.
+    
+    print(f"[DEBUG_VAL] Calling i2t with img_embs.shape={img_embs.shape}, cap_embs.shape={cap_embs.shape}, sims.shape={sims.shape}")
+    (r1, r5, r10, medr, meanr), (i2t_ranks, i2t_top1) = i2t(img_embs, cap_embs, sims)
+    print(f"Image to Text: R@1: {r1:.1f}, R@5: {r5:.1f}, R@10: {r10:.1f}, MedianR: {medr:.1f}, MeanR: {meanr:.1f}")
+    
+    print(f"[DEBUG_VAL] Calling t2i with img_embs.shape={img_embs.shape}, cap_embs.shape={cap_embs.shape}, sims.shape={sims.shape}")
+    (r1i, r5i, r10i, medri, meanri), (t2i_ranks, t2i_top1) = t2i(img_embs, cap_embs, sims)
+    print(f"Text to Image: R@1: {r1i:.1f}, R@5: {r5i:.1f}, R@10: {r10i:.1f}, MedianR: {medri:.1f}, MeanR: {meanri:.1f}")
 
-    r1i, r5i, r10i, medri, meanr = t2i(img_embs, cap_embs, sims)
-    print(f"Text to Image Retrieval: R@1: {r1i:.1f}, R@5: {r5i:.1f}, R@10: {r10i:.1f}")
+    # Calculate the sum of recalls
+    rsum = r1 + r5 + r10 + r1i + r5i + r10i
+    print(f"rSum: {rsum:.1f}")
+    
+    return rsum
 
-    return r1 + r5 + r10 + r1i + r5i + r10i
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar', prefix=''):
+    """
+    Save model state to disk; if is_best=True, also copy to model_best.pth.tar.
+    """
     torch.save(state, prefix + filename)
     if is_best:
-        print(f"Best model saved at epoch {state['epoch']}")
+        print(f"[DEBUG] Best model saved at epoch {state['epoch']}")
         shutil.copyfile(prefix + filename, prefix + 'model_best.pth.tar')
 
 def adjust_learning_rate(opt, optimizer, epoch):
-    """Decay learning rate every few epochs"""
+    """
+    Decay learning rate by factor 0.1 every 15 epochs.
+    """
     lr = opt.learning_rate * (0.1 ** (epoch // 15))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
